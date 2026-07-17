@@ -107,8 +107,15 @@ class AbstractAPI:
     _max_tries: int = 2
     """Retries for backoff"""
 
-    _timeout: int = 600
-    """Timeout for requests-methods as needed by package 'requests'."""
+    _connect_timeout: Union[int, float] = 10
+    """Default connect timeout (in seconds) used when *timeout* is given as a single scalar value."""
+
+    _timeout: Union[int, float, Tuple[Union[int, float], Union[int, float]]] = (10, 600)
+    """
+    Timeout for requests-methods as needed by package 'requests'. This is a tuple *(connect, read)* so the connection
+    establishment is bounded by a short connect timeout while the (potentially slow) read is bounded separately. A
+    single scalar value is also accepted and will be combined with the default connect timeout.
+    """
 
     _raise_exceptions: bool = True
     """Raise an exception when the status-code of results indicates an error"""
@@ -128,7 +135,7 @@ class AbstractAPI:
                  raise_exceptions: bool = True,
                  proxies: dict = None,
                  headers: dict = None,
-                 timeout: int = None,
+                 timeout: Optional[Union[int, float, Tuple[Union[int, float], Union[int, float]]]] = None,
                  client_name: str = None,
                  ssl_config: SSLConfig = None,
                  log_communication_on_error: bool = None,
@@ -147,7 +154,10 @@ class AbstractAPI:
         :param raise_exceptions: Raise exceptions on HTTP status codes that denote an error. Default is True.
         :param proxies: Proxy configuration for *requests*. Default is None.
         :param headers: Optional custom HTTP headers. Will be merged with the internal default headers. Default is None.
-        :param timeout: Optional timeout for requests. Default is 600 (10 min).
+        :param timeout: Optional timeout (in seconds) for requests. Can be a single scalar (applied as read timeout,
+               combined with the default connect timeout) or a tuple *(connect, read)* passed straight to *requests*.
+               A short connect timeout avoids hanging for the full read timeout when a host is unreachable. Default is
+               *(10, 600)*, i.e. a 10 second connect timeout and a 600 second (10 min) read timeout.
         :param client_name: Optional name for the client. Will also be part of the "User-Agent" header unless *headers*
                is given with another value for "User-Agent". Default is "hiro-graph-client".
         :param ssl_config: Optional configuration for SSL connections. If this is omitted, the defaults of `requests`
@@ -193,9 +203,29 @@ class AbstractAPI:
 
         self._proxies = proxies
         self._raise_exceptions = raise_exceptions
-        self._timeout = timeout or self._timeout
+        self._timeout = self._normalize_timeout(timeout)
         self._log_communication_on_error = log_communication_on_error or False
         self._max_tries = max_tries
+
+    def _normalize_timeout(
+            self,
+            timeout: Optional[Union[int, float, Tuple[Union[int, float], Union[int, float]]]]
+    ) -> Union[int, float, Tuple[Union[int, float], Union[int, float]]]:
+        """
+        Normalize the *timeout* value into a form accepted by *requests*.
+
+        A tuple *(connect, read)* is passed through unchanged. A single scalar is combined with the default connect
+        timeout into a *(connect, read)* tuple so connection establishment does not hang for the full read timeout.
+        *None* falls back to the current (already normalized) default.
+
+        :param timeout: The timeout value given to the constructor.
+        :return: Either a scalar or a *(connect, read)* tuple as understood by *requests*.
+        """
+        if timeout is None:
+            return self._timeout
+        if isinstance(timeout, (tuple, list)):
+            return timeout[0], timeout[1]
+        return self._connect_timeout, timeout
 
     def _get_max_tries(self):
         return self._max_tries
