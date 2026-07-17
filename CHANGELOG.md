@@ -1,8 +1,13 @@
-# v5.3.3
+# v5.3.4
 
 * [bugfix] Connection establishment now honors a dedicated connect timeout. The `timeout` parameter accepts a
   `(connect, read)` tuple (or a scalar, which is combined with the default connect timeout). The default changed from
   `600` to `(10, 600)` so an unreachable host no longer blocks for the full read timeout.
+
+# v5.3.3
+
+* Update setuptools.
+* Fix `escaped_query`.
 
 # v5.3.2
 
