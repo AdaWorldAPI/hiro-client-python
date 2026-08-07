@@ -1,3 +1,9 @@
+# v5.3.5
+
+* [bugfix] An unset `max_tries` was stored as `None`, which `backoff` interprets as "retry forever". Requests to an
+  unreachable host therefore retried endlessly and never surfaced the connect timeout added in v5.3.4. `max_tries` now
+  falls back to its documented default of `2`.
+
 # v5.3.4
 
 * [bugfix] Connection establishment now honors a dedicated connect timeout. The `timeout` parameter accepts a

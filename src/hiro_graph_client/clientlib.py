@@ -205,7 +205,7 @@ class AbstractAPI:
         self._raise_exceptions = raise_exceptions
         self._timeout = self._normalize_timeout(timeout)
         self._log_communication_on_error = log_communication_on_error or False
-        self._max_tries = max_tries
+        self._max_tries = max_tries or self._max_tries
 
     def _normalize_timeout(
             self,
