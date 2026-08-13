@@ -3,16 +3,19 @@ import base64
 import json
 import logging
 import os
+import socket
 import threading
 import time
 import urllib
 from abc import abstractmethod
-from typing import Optional, Any, Iterator, Union, Tuple
+from contextlib import contextmanager
+from typing import Optional, Any, Iterator, List, Union, Tuple
 from urllib.parse import quote, urlencode
 
 import backoff
 import requests
 import requests.adapters
+import urllib3
 
 from hiro_graph_client.version import __version__
 
@@ -27,6 +30,86 @@ BACKOFF_KWARGS = {
     'jitter': backoff.random_jitter,
     'giveup': lambda e: e.response is not None and e.response.status_code < 500
 }
+
+TIMEOUT_CAUSES = (urllib3.exceptions.TimeoutError, socket.timeout, TimeoutError)
+"""Exception types that identify an underlying timeout, no matter which *requests* exception wraps them."""
+
+
+def _is_timeout_error(err: BaseException) -> bool:
+    """
+    Check whether *err* has been caused by a timeout.
+
+    This is needed because *requests* does not report every timeout as a *requests.exceptions.Timeout*: when the
+    timeout happens while the response *body* is being read, it surfaces as a plain *requests.exceptions.ConnectionError*
+    instead. The original timeout is still reachable through the exception arguments and the __cause__/__context__
+    chain, so search those instead of matching on the error message.
+
+    :param err: The exception to inspect.
+    :return: True when a timeout is found anywhere in the chain of causes.
+    """
+    pending: List[BaseException] = [err]
+    seen: set = set()
+
+    while pending:
+        current = pending.pop()
+
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        if isinstance(current, TIMEOUT_CAUSES):
+            return True
+
+        pending.extend(item for item in (*current.args, current.__cause__, current.__context__)
+                       if isinstance(item, BaseException))
+
+    return False
+
+
+def _as_hiro_timeout(err: requests.exceptions.RequestException) -> 'HiroTimeoutError':
+    """
+    Create the :class:`HiroTimeoutError` matching *err*.
+
+    The returned exception keeps the original *requests* class as a second base class, so error handling that catches
+    the specific *requests* exception keeps working unchanged.
+
+    :param err: The original timeout exception raised by *requests*.
+    :return: The matching :class:`HiroTimeoutError` subclass.
+    """
+    if isinstance(err, requests.exceptions.ConnectTimeout):
+        error_class = HiroConnectTimeoutError
+    elif isinstance(err, requests.exceptions.ReadTimeout):
+        error_class = HiroReadTimeoutError
+    elif isinstance(err, requests.exceptions.ConnectionError):
+        error_class = HiroBodyTimeoutError
+    else:
+        error_class = HiroTimeoutError
+
+    return error_class(*err.args, request=err.request, response=err.response)
+
+
+@contextmanager
+def _translate_timeout_errors() -> Iterator[None]:
+    """
+    Context manager that normalizes all timeouts of *requests* so they can be caught as a single
+    :class:`HiroTimeoutError`.
+
+    Without this, the exception class raised on a timeout depends on *when* the timeout happens: *ConnectTimeout* while
+    connecting, *ReadTimeout* while waiting for the response headers and *ConnectionError* while reading the response
+    body. Callers had to know all three to handle a timeout reliably.
+
+    :raises HiroTimeoutError: When the wrapped code times out.
+    """
+    try:
+        yield
+    except HiroTimeoutError:
+        raise
+    except requests.exceptions.Timeout as err:
+        raise _as_hiro_timeout(err) from err
+    except requests.exceptions.ConnectionError as err:
+        if not _is_timeout_error(err):
+            raise
+        raise _as_hiro_timeout(err) from err
 
 
 ###################################################################################################################
@@ -271,7 +354,8 @@ class AbstractAPI:
 
                 yield from res.iter_content(chunk_size=65536)
 
-        yield from _get_binary()
+        with _translate_timeout_errors():
+            yield from _get_binary()
 
     def post_binary(self,
                     url: str,
@@ -303,7 +387,8 @@ class AbstractAPI:
             self._log_communication(res, request_body=False)
             return self._parse_response(res, expected_media_type)
 
-        return _post_binary()
+        with _translate_timeout_errors():
+            return _post_binary()
 
     def put_binary(self,
                    url: str,
@@ -335,7 +420,8 @@ class AbstractAPI:
             self._log_communication(res, request_body=False)
             return self._parse_response(res, expected_media_type)
 
-        return _put_binary()
+        with _translate_timeout_errors():
+            return _put_binary()
 
     def get(self,
             url: str,
@@ -360,7 +446,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _get()
+        with _translate_timeout_errors():
+            return _get()
 
     def post(self,
              url: str,
@@ -388,7 +475,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _post()
+        with _translate_timeout_errors():
+            return _post()
 
     def put(self,
             url: str,
@@ -416,7 +504,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _put()
+        with _translate_timeout_errors():
+            return _put()
 
     def patch(self,
               url: str,
@@ -444,7 +533,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _patch()
+        with _translate_timeout_errors():
+            return _patch()
 
     def delete(self,
                url: str,
@@ -469,7 +559,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _delete()
+        with _translate_timeout_errors():
+            return _delete()
 
     ###############################################################################################################
     # Tool methods for requests
@@ -1547,5 +1638,46 @@ class WrongContentTypeError(Exception):
     """
     When the Content-Type of the result is unexpected, i.e. 'application/json' was expected, but something else got
     returned.
+    """
+    pass
+
+
+class HiroTimeoutError(requests.exceptions.Timeout, TimeoutError):
+    """
+    Raised when a request times out. Catch this to handle *any* timeout.
+
+    *requests* uses a different exception class depending on *when* a timeout occurs: *ConnectTimeout* while connecting,
+    *ReadTimeout* while waiting for the response headers, but a plain *ConnectionError* when the timeout happens while
+    the response body is being read. That last one is not even a *requests.exceptions.Timeout*, which made it easy to
+    miss a timeout in error handling. All of them are raised as a subclass of this class instead.
+
+    This inherits from both :class:`requests.exceptions.Timeout` and the builtin :class:`TimeoutError`, so all of the
+    following catch it::
+
+        except HiroTimeoutError            # explicit
+        except TimeoutError                # builtin
+        except requests.exceptions.Timeout # remains compatible with existing error handling
+
+    The subclasses below additionally keep the original *requests* class, so error handling that catches a specific
+    *requests* exception keeps working unchanged.
+    """
+    pass
+
+
+class HiroConnectTimeoutError(requests.exceptions.ConnectTimeout, HiroTimeoutError):
+    """Raised when the connection to the server could not be established within the connect timeout."""
+    pass
+
+
+class HiroReadTimeoutError(requests.exceptions.ReadTimeout, HiroTimeoutError):
+    """Raised when the server did not send the response headers within the read timeout."""
+    pass
+
+
+class HiroBodyTimeoutError(requests.exceptions.ConnectionError, HiroTimeoutError):
+    """
+    Raised when the server stopped sending data while the response body was being read.
+
+    *requests* reports this as a plain *ConnectionError*, which is why this keeps *ConnectionError* as a base class.
     """
     pass

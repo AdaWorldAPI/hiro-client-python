@@ -3,6 +3,13 @@
 * [bugfix] An unset `max_tries` was stored as `None`, which `backoff` interprets as "retry forever". Requests to an
   unreachable host therefore retried endlessly and never surfaced the connect timeout added in v5.3.4. `max_tries` now
   falls back to its documented default of `2`.
+* [bugfix] Timeouts are now raised as `HiroTimeoutError`, which inherits from both `requests.exceptions.Timeout` and
+  the builtin `TimeoutError`. Previously the exception class depended on when the timeout occurred, and a timeout while
+  reading the response body surfaced as a plain `requests.exceptions.ConnectionError` - so it was not caught by
+  `except TimeoutError` nor by `except requests.exceptions.Timeout` and crashed the calling script. The subclasses
+  `HiroConnectTimeoutError`, `HiroReadTimeoutError` and `HiroBodyTimeoutError` keep the original `requests` class as an
+  additional base class, so existing error handling keeps working unchanged. See "Timeouts and error handling" in
+  `src/README.md`.
 
 # v5.3.4
 

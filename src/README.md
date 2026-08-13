@@ -301,6 +301,68 @@ data_iter = hiro_client.get_attachment(ogit_id)
 attachment = b''.join(data_iter)
 ```
 
+## Timeouts and error handling
+
+### Setting timeouts
+
+All clients and handlers accept a `timeout` (in seconds). It is either a tuple `(connect, read)` or a single scalar,
+which is used as the read timeout and combined with the default connect timeout of 10 seconds. The default is
+`(10, 600)`.
+
+```python
+from hiro_graph_client import PasswordAuthTokenApiHandler
+
+# 5s to establish the connection, 60s to wait for the response
+hiro_token_handler = PasswordAuthTokenApiHandler(
+    root_url='https://core.engine.datagroup.de',
+    username='', password='', client_id='', client_secret='',
+    timeout=(5, 60)
+)
+```
+
+Note that `timeout` applies **per attempt**, not to the call as a whole. Failing requests are retried with backoff
+(see `max_tries`, default 2), so the worst case for an unreachable host is roughly
+`max_tries * (connect + read) + backoff delays`. Set `max_tries=1` to disable retrying.
+
+### Catching timeouts
+
+A timeout raises `HiroTimeoutError`. Catch it to handle every kind of timeout:
+
+```python
+from hiro_graph_client import HiroTimeoutError
+
+try:
+    hiro_client.create_node(data, 'ogit/Person')
+except HiroTimeoutError as err:
+    print(f"Request timed out: {err}")
+```
+
+`HiroTimeoutError` inherits from both `requests.exceptions.Timeout` and the builtin `TimeoutError`, so
+`except TimeoutError` and `except requests.exceptions.Timeout` catch it as well.
+
+This matters because `requests` on its own raises a *different* exception class depending on when the timeout happens,
+and one of them is not a `Timeout` at all:
+
+| Timeout occurs while ...        | `requests` raises  | this library raises        |
+|---------------------------------|--------------------|----------------------------|
+| establishing the connection     | `ConnectTimeout`   | `HiroConnectTimeoutError`  |
+| waiting for the response header | `ReadTimeout`      | `HiroReadTimeoutError`     |
+| reading the response body       | `ConnectionError`  | `HiroBodyTimeoutError`     |
+
+Because a timeout while reading the response body surfaces as a plain `ConnectionError`, a
+`try ... except requests.exceptions.Timeout` block does **not** catch it and the script fails with an uncaught
+exception. All three cases are subclasses of `HiroTimeoutError`, so catching that one class is enough.
+
+The subclasses keep the original `requests` class as an additional base class, so existing error handling that
+catches `requests.exceptions.ConnectTimeout`, `ReadTimeout` or `ConnectionError` keeps working unchanged.
+
+### Other errors
+
+HTTP error responses raise `requests.exceptions.HTTPError` unless the handler has been created with
+`raise_exceptions=False`. Problems with tokens raise `AuthenticationTokenError` or its subclasses
+`TokenUnauthorizedError` and `FixedTokenError`. To catch anything a request can throw, use
+`requests.exceptions.RequestException`, which is a base class of all of the above except the token errors.
+
 ## WebSockets
 
 This library contains classes that make using HIRO WebSocket protocols easier. They handle authentication, exceptions
