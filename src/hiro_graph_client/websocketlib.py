@@ -10,9 +10,9 @@ from typing import List, Dict, Optional
 from urllib.parse import urlencode
 
 from websocket import WebSocketApp, ABNF, WebSocketException, setdefaulttimeout, WebSocketConnectionClosedException, \
-    STATUS_NORMAL, STATUS_UNEXPECTED_CONDITION
+    WebSocketBadStatusException, STATUS_NORMAL, STATUS_UNEXPECTED_CONDITION
 
-from hiro_graph_client.clientlib import AbstractTokenApiHandler
+from hiro_graph_client.clientlib import AbstractTokenApiHandler, parse_retry_after
 
 logger = logging.getLogger(__name__)
 """ The logger for this module """
@@ -157,6 +157,7 @@ class AbstractAuthenticatedWebSocketHandler:
 
         self._ws_guard = threading.RLock()
         self._backoff_condition = threading.Condition()
+        self._rate_limit_delay = None
 
         if remote_exit_codes:
             self._remote_exit_codes = remote_exit_codes
@@ -288,21 +289,34 @@ class AbstractAuthenticatedWebSocketHandler:
                 if self._reader_status == ReaderStatus.DONE and isinstance(error, OSError) and error.errno == 9:
                     return
 
-            self._set_error(error)
+            if isinstance(error, WebSocketBadStatusException) and error.status_code == 429:
+                # Rate limited while opening the connection. This is not fatal: wait as demanded and reconnect.
+                headers = {k.lower(): v for k, v in (error.resp_headers or {}).items()}
+                self._rate_limit_delay = parse_retry_after(headers.get('retry-after'))
+                logger.warning("Rate limited while opening websocket (retry-after: %s). Will reconnect.",
+                               headers.get('retry-after'))
+            else:
+                self._set_error(error)
+
             self.on_error(ws, error)
         except Exception as err:
             self._set_error(err)
 
     def _backoff(self, reconnect_delay: int) -> int:
         """
-        Sleeps for *reconnect_delay* seconds, then returns the delay in seconds for the next try.
+        Sleeps for *reconnect_delay* seconds (at least the *Retry-After* of a preceding 429, if any), then returns the delay in seconds for the next try.
 
         :param reconnect_delay: Delay in seconds to wait.
         :return: Next value for the delay.
         """
+        wait = reconnect_delay
+        if self._rate_limit_delay is not None:
+            wait = max(wait, self._rate_limit_delay)
+            self._rate_limit_delay = None
+
         with self._backoff_condition:
-            if reconnect_delay:
-                self._backoff_condition.wait(timeout=reconnect_delay)
+            if wait:
+                self._backoff_condition.wait(timeout=wait)
 
         return (reconnect_delay + 1) if reconnect_delay < 10 \
             else (reconnect_delay + 10) if reconnect_delay < 60 \

@@ -3,12 +3,14 @@ import base64
 import json
 import logging
 import os
+import random
 import socket
 import threading
 import time
 import urllib
 from abc import abstractmethod
 from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
 from typing import Optional, Any, Iterator, List, Union, Tuple
 from urllib.parse import quote, urlencode
 
@@ -30,6 +32,30 @@ BACKOFF_KWARGS = {
     'jitter': backoff.random_jitter,
     'giveup': lambda e: e.response is not None and e.response.status_code < 500
 }
+
+def parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """
+    Parse the value of a *Retry-After* header (RFC 9110), which is either a number of seconds or an HTTP date.
+
+    :param value: The raw header value.
+    :return: The number of seconds to wait (never negative), or None when *value* is missing or invalid.
+    """
+    if not value:
+        return None
+
+    value = value.strip()
+
+    try:
+        seconds = float(value)
+        return seconds if seconds >= 0 else None
+    except ValueError:
+        pass
+
+    try:
+        return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
 
 TIMEOUT_CAUSES = (urllib3.exceptions.TimeoutError, socket.timeout, TimeoutError)
 """Exception types that identify an underlying timeout, no matter which *requests* exception wraps them."""
@@ -190,6 +216,12 @@ class AbstractAPI:
     _max_tries: int = 2
     """Retries for backoff"""
 
+    _rate_limit_max_retries: int = 3
+    """Number of times a request is repeated after the backend answered with status 429 (Too Many Requests)."""
+
+    _rate_limit_max_wait: Union[int, float] = 60
+    """Max seconds to wait for a single retry after status 429. A longer wait raises *HiroRateLimitError* instead."""
+
     _connect_timeout: Union[int, float] = 10
     """Default connect timeout (in seconds) used when *timeout* is given as a single scalar value."""
 
@@ -223,6 +255,8 @@ class AbstractAPI:
                  ssl_config: SSLConfig = None,
                  log_communication_on_error: bool = None,
                  max_tries: int = None,
+                 rate_limit_max_retries: int = None,
+                 rate_limit_max_wait: Union[int, float] = None,
                  abstract_api=None):
 
         """
@@ -248,6 +282,10 @@ class AbstractAPI:
         :param log_communication_on_error: Log socket communication when an error (status_code of HTTP Response) is
                detected. Default is not to do this.
         :param max_tries: Max tries for BACKOFF. Default is 2.
+        :param rate_limit_max_retries: How often a request is repeated when the backend answers with status 429 (rate
+               limited), after waiting as demanded by the *Retry-After* header. Default is 3. Set to 0 to disable.
+        :param rate_limit_max_wait: Max seconds to wait for a single retry after status 429. When the backend demands a
+               longer wait, *HiroRateLimitError* is raised right away. Default is 60. Set to 0 to never wait.
         :param abstract_api: Set all parameters by copying them from the instance given by this parameter. Overrides
                all other parameters except headers, which will be merged with existing ones.
         """
@@ -263,6 +301,8 @@ class AbstractAPI:
             ssl_config = abstract_api.ssl_config
             log_communication_on_error = abstract_api._log_communication_on_error
             max_tries = abstract_api._max_tries
+            rate_limit_max_retries = abstract_api._rate_limit_max_retries
+            rate_limit_max_wait = abstract_api._rate_limit_max_wait
         else:
             initial_headers = {
                 'Content-Type': 'application/json',
@@ -289,6 +329,10 @@ class AbstractAPI:
         self._timeout = self._normalize_timeout(timeout)
         self._log_communication_on_error = log_communication_on_error or False
         self._max_tries = max_tries or self._max_tries
+        if rate_limit_max_retries is not None:
+            self._rate_limit_max_retries = rate_limit_max_retries
+        if rate_limit_max_wait is not None:
+            self._rate_limit_max_wait = rate_limit_max_wait
 
     def _normalize_timeout(
             self,
@@ -355,7 +399,7 @@ class AbstractAPI:
                 yield from res.iter_content(chunk_size=65536)
 
         with _translate_timeout_errors():
-            yield from _get_binary()
+            yield from self._retry_generator_on_rate_limit(_get_binary)
 
     def post_binary(self,
                     url: str,
@@ -388,7 +432,7 @@ class AbstractAPI:
             return self._parse_response(res, expected_media_type)
 
         with _translate_timeout_errors():
-            return _post_binary()
+            return self._retry_on_rate_limit(_post_binary)
 
     def put_binary(self,
                    url: str,
@@ -421,7 +465,7 @@ class AbstractAPI:
             return self._parse_response(res, expected_media_type)
 
         with _translate_timeout_errors():
-            return _put_binary()
+            return self._retry_on_rate_limit(_put_binary)
 
     def get(self,
             url: str,
@@ -447,7 +491,7 @@ class AbstractAPI:
             return self._parse_response(res, expected_media_type)
 
         with _translate_timeout_errors():
-            return _get()
+            return self._retry_on_rate_limit(_get)
 
     def post(self,
              url: str,
@@ -476,7 +520,7 @@ class AbstractAPI:
             return self._parse_response(res, expected_media_type)
 
         with _translate_timeout_errors():
-            return _post()
+            return self._retry_on_rate_limit(_post)
 
     def put(self,
             url: str,
@@ -505,7 +549,7 @@ class AbstractAPI:
             return self._parse_response(res, expected_media_type)
 
         with _translate_timeout_errors():
-            return _put()
+            return self._retry_on_rate_limit(_put)
 
     def patch(self,
               url: str,
@@ -534,7 +578,7 @@ class AbstractAPI:
             return self._parse_response(res, expected_media_type)
 
         with _translate_timeout_errors():
-            return _patch()
+            return self._retry_on_rate_limit(_patch)
 
     def delete(self,
                url: str,
@@ -560,7 +604,7 @@ class AbstractAPI:
             return self._parse_response(res, expected_media_type)
 
         with _translate_timeout_errors():
-            return _delete()
+            return self._retry_on_rate_limit(_delete)
 
     ###############################################################################################################
     # Tool methods for requests
@@ -631,6 +675,65 @@ class AbstractAPI:
         """
         params_cleaned = {k: AbstractAPI._bool_to_external_str(v) for k, v in params.items() if v is not None}
         return ('?' + urlencode(params_cleaned, quote_via=quote, safe="/,")) if params_cleaned else ""
+
+    def _wait_for_rate_limit(self, err: "HiroRateLimitError", attempt: int) -> None:
+        """
+        Sleep before repeating a request that has been rejected with status 429.
+
+        :param err: The rate limit error. Its *retry_after* is used as wait time, with an exponential fallback.
+        :param attempt: Number of the retry that is about to happen, starting at 1.
+        :raises HiroRateLimitError: *err* itself, when all retries are used up or the wait exceeds the configured cap.
+        """
+        if attempt > self._rate_limit_max_retries:
+            raise err
+
+        wait = err.retry_after if err.retry_after is not None else 2 ** (attempt - 1)
+
+        if wait > self._rate_limit_max_wait:
+            raise err
+
+        wait += random.uniform(0, min(1.0, wait * 0.1))
+
+        logger.warning("Rate limited by %s (policy: %s). Retry %d/%d in %.1fs.",
+                       err.response.url if err.response is not None else "backend",
+                       err.policy, attempt, self._rate_limit_max_retries, wait)
+        time.sleep(wait)
+
+    def _retry_on_rate_limit(self, func):
+        """
+        Call *func* and repeat it as long as the backend answers with status 429, see *_wait_for_rate_limit()*.
+
+        :param func: A function without parameters that performs the request.
+        :return: The result of *func*.
+        """
+        attempt = 0
+        while True:
+            try:
+                return func()
+            except HiroRateLimitError as err:
+                attempt += 1
+                self._wait_for_rate_limit(err, attempt)
+
+    def _retry_generator_on_rate_limit(self, func):
+        """
+        Like *_retry_on_rate_limit()*, for a generator function. A request is only repeated as long as nothing
+        has been yielded yet.
+
+        :param func: A generator function without parameters.
+        """
+        attempt = 0
+        while True:
+            started = False
+            try:
+                for item in func():
+                    started = True
+                    yield item
+                return
+            except HiroRateLimitError as err:
+                if started:
+                    raise
+                attempt += 1
+                self._wait_for_rate_limit(err, attempt)
 
     def _parse_response(self,
                         res: requests.Response,
@@ -734,6 +837,9 @@ class AbstractAPI:
                 except (json.JSONDecodeError, KeyError, WrongContentTypeError):
                     if '_TOKEN' not in res.text:
                         http_error_msg += ": " + str(res.text)
+
+            if res.status_code == 429:
+                raise HiroRateLimitError(http_error_msg, response=err.response) from err
 
             raise requests.exceptions.HTTPError(http_error_msg, response=err.response) from err
 
@@ -1640,6 +1746,33 @@ class WrongContentTypeError(Exception):
     returned.
     """
     pass
+
+
+class HiroRateLimitError(requests.exceptions.HTTPError):
+    """
+    The backend rejected the request with status 429 (Too Many Requests) and the request could not be completed by
+    waiting and retrying (see *rate_limit_max_retries* and *rate_limit_max_wait* of *AbstractAPI*).
+
+    It is an *HTTPError*, so existing handlers for that keep working.
+    """
+
+    @property
+    def retry_after(self) -> Optional[float]:
+        """Seconds the backend asked to wait (header *Retry-After*), or None."""
+        return parse_retry_after(self._header('Retry-After'))
+
+    @property
+    def policy(self) -> Optional[str]:
+        """Raw value of the header *RateLimit-Policy*, or None."""
+        return self._header('RateLimit-Policy')
+
+    @property
+    def ratelimit(self) -> Optional[str]:
+        """Raw value of the header *RateLimit*, or None."""
+        return self._header('RateLimit')
+
+    def _header(self, name: str) -> Optional[str]:
+        return self.response.headers.get(name) if self.response is not None else None
 
 
 class HiroTimeoutError(requests.exceptions.Timeout, TimeoutError):
