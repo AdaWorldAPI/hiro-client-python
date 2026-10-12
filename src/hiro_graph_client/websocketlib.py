@@ -12,7 +12,7 @@ from urllib.parse import urlencode
 from websocket import WebSocketApp, ABNF, WebSocketException, setdefaulttimeout, WebSocketConnectionClosedException, \
     WebSocketBadStatusException, STATUS_NORMAL, STATUS_UNEXPECTED_CONDITION
 
-from hiro_graph_client.clientlib import AbstractTokenApiHandler, parse_retry_after
+from hiro_graph_client.clientlib import AbstractTokenApiHandler, parse_retry_after, jittered_wait
 
 logger = logging.getLogger(__name__)
 """ The logger for this module """
@@ -304,23 +304,43 @@ class AbstractAuthenticatedWebSocketHandler:
 
     def _backoff(self, reconnect_delay: int) -> int:
         """
-        Sleeps for *reconnect_delay* seconds (at least the *Retry-After* of a preceding 429, if any), then returns the delay in seconds for the next try.
+        Sleeps for *reconnect_delay* seconds, then returns the delay in seconds for the next try.
+
+        This is also used by *send()* in arbitrary threads, so it deliberately knows nothing about *Retry-After*.
+        See *_reconnect_backoff()*.
 
         :param reconnect_delay: Delay in seconds to wait.
         :return: Next value for the delay.
         """
-        wait = reconnect_delay
-        if self._rate_limit_delay is not None:
-            wait = max(wait, self._rate_limit_delay)
-            self._rate_limit_delay = None
-
         with self._backoff_condition:
-            if wait:
-                self._backoff_condition.wait(timeout=wait)
+            if reconnect_delay:
+                self._backoff_condition.wait(timeout=reconnect_delay)
 
+        return self._next_delay(reconnect_delay)
+
+    @staticmethod
+    def _next_delay(reconnect_delay: int) -> int:
         return (reconnect_delay + 1) if reconnect_delay < 10 \
             else (reconnect_delay + 10) if reconnect_delay < 60 \
             else random.randint(60, 600)
+
+    def _reconnect_backoff(self, reconnect_delay: int) -> int:
+        """
+        Like *_backoff()*, but waits at least (with jitter) for the *Retry-After* of a preceding 429 on connect, if
+        any. Only the reconnect loop in *run_forever()* may call this, so no other thread can take the delay away.
+
+        :param reconnect_delay: Delay in seconds to wait.
+        :return: Next value for the delay.
+        """
+        retry_after, self._rate_limit_delay = self._rate_limit_delay, None
+
+        if retry_after is None:
+            return self._backoff(reconnect_delay)
+
+        with self._backoff_condition:
+            self._backoff_condition.wait(timeout=max(reconnect_delay, jittered_wait(retry_after)))
+
+        return self._next_delay(reconnect_delay)
 
     def _close(self, status: str = STATUS_NORMAL, reason: str = None):
         """
@@ -457,7 +477,7 @@ class AbstractAuthenticatedWebSocketHandler:
                 finally:
                     self._reader_guard.acquire()
 
-                self._reconnect_delay = self._backoff(self._reconnect_delay)
+                self._reconnect_delay = self._reconnect_backoff(self._reconnect_delay)
 
             self.on_close(self._ws)
 

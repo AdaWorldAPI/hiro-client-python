@@ -57,6 +57,19 @@ def parse_retry_after(value: Optional[str]) -> Optional[float]:
         return None
 
 
+def jittered_wait(wait: float, cap: Optional[float] = None) -> float:
+    """
+    Add a little random jitter to a wait so clients that have been told the same *Retry-After* do not all come back
+    at the same moment.
+
+    :param wait: Seconds to wait at least.
+    :param cap: Optional upper bound of the result. Never reduces the result below *wait*.
+    :return: *wait* plus up to 10% (max 1s) of jitter.
+    """
+    jittered = wait + random.uniform(0, min(1.0, wait * 0.1))
+    return jittered if cap is None else max(wait, min(jittered, cap))
+
+
 TIMEOUT_CAUSES = (urllib3.exceptions.TimeoutError, socket.timeout, TimeoutError)
 """Exception types that identify an underlying timeout, no matter which *requests* exception wraps them."""
 
@@ -692,7 +705,7 @@ class AbstractAPI:
         if wait > self._rate_limit_max_wait:
             raise err
 
-        wait += random.uniform(0, min(1.0, wait * 0.1))
+        wait = jittered_wait(wait, cap=self._rate_limit_max_wait)
 
         logger.warning("Rate limited by %s (policy: %s). Retry %d/%d in %.1fs.",
                        err.response.url if err.response is not None else "backend",

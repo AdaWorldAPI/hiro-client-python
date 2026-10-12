@@ -385,7 +385,14 @@ except HiroRateLimitError as err:
 by all clients that use it via `api_handler=`, like the other connection settings. Streaming downloads
 (`get_binary`) are only repeated as long as no data has been received yet.
 
-WebSockets that get a 429 while connecting do not fail. They wait at least `Retry-After` seconds and reconnect.
+This policy (at most 3 retries, each wait capped at 60s, then raise) is a deliberate choice for a library: a caller
+is neither left blocked indefinitely nor forced to implement the waiting itself. Use `rate_limit_max_retries=0` to
+handle 429 completely on your own.
+
+WebSockets that get a 429 while connecting do not fail. They wait at least `Retry-After` seconds (plus jitter) and
+reconnect. The action WebSocket also handles the in-band `{"error": {"code": 429, "retryAfterMs": ...}, "id": ...}`
+that the ws-proxy sends for a denied frame: a stored `sendActionResult` is sent again after `retryAfterMs`, until it
+is acknowledged or has expired. It is never answered with a `negativeAcknowledged`.
 
 ### Other errors
 

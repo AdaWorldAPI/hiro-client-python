@@ -113,6 +113,14 @@ class TestRateLimitRetry:
         assert sleep.call_count == 1
         assert 2.0 <= sleep.call_args[0][0] <= 2.2
 
+    def test_wait_with_jitter_never_exceeds_cap(self):
+        api, _ = _make_api(_limited("60"), _response(200), rate_limit_max_wait=60)
+
+        with patch(SLEEP) as sleep, patch("hiro_graph_client.clientlib.random.uniform", side_effect=lambda a, b: b):
+            api.get(URL)
+
+        assert sleep.call_args[0][0] == 60
+
     def test_gives_up_after_max_retries(self):
         api, session = _make_api(*[_limited("1")] * 4, rate_limit_max_retries=3)
 
@@ -212,15 +220,35 @@ class TestWebSocketRateLimit:
         assert handler._reader_status != ReaderStatus.FAILED
         assert handler._rate_limit_delay == 30.0
 
-    def test_backoff_honors_retry_after(self):
+    def test_reconnect_backoff_honors_retry_after_with_jitter(self):
+        handler = self._handler()
+        handler._rate_limit_delay = 30.0
+
+        with patch.object(handler._backoff_condition, "wait") as wait, \
+                patch("hiro_graph_client.clientlib.random.uniform", side_effect=lambda a, b: b):
+            handler._reconnect_backoff(1)
+
+        assert 30.0 < wait.call_args[1]["timeout"] <= 33.0
+        assert handler._rate_limit_delay is None
+
+    def test_reconnect_backoff_without_retry_after_is_plain(self):
+        handler = self._handler()
+
+        with patch.object(handler._backoff_condition, "wait") as wait:
+            assert handler._reconnect_backoff(3) == 4
+
+        assert wait.call_args[1]["timeout"] == 3
+
+    def test_send_backoff_does_not_consume_retry_after(self):
+        """*send()* runs in worker threads. It must neither wait for nor clear the delay meant for the reconnect."""
         handler = self._handler()
         handler._rate_limit_delay = 30.0
 
         with patch.object(handler._backoff_condition, "wait") as wait:
-            handler._backoff(1)
+            handler._backoff(0)
 
-        assert wait.call_args[1]["timeout"] == 30.0
-        assert handler._rate_limit_delay is None
+        wait.assert_not_called()
+        assert handler._rate_limit_delay == 30.0
 
     def test_other_handshake_errors_still_fail(self):
         from hiro_graph_client.websocketlib import ReaderStatus
