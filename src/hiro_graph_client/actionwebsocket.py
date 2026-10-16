@@ -12,7 +12,7 @@ from apscheduler.jobstores.base import JobLookupError
 from apscheduler.schedulers.background import BackgroundScheduler
 from websocket import WebSocketApp
 
-from hiro_graph_client.clientlib import AbstractTokenApiHandler
+from hiro_graph_client.clientlib import AbstractTokenApiHandler, jittered_wait
 from hiro_graph_client.websocketlib import AbstractAuthenticatedWebSocketHandler
 
 logger = logging.getLogger(__name__)
@@ -247,6 +247,36 @@ class ActionHandlerError(AbstractActionHandlerCodeMessage):
         )
 
 
+class ActionHandlerRateLimited(AbstractActionHandlerMessage):
+    """
+    The in-band answer of the ws-proxy to a frame that has been denied by the rate limiter. It has no *type* on the
+    wire, so *type* here only is a synthetic name.
+
+    ::
+
+        {"error": {"code": 429, "retryAfterMs": 1500}, "id": "<id of our message>"}
+    """
+    type = 'rateLimited'
+
+    id: Optional[str]
+    """ Id of the rejected message. May be None. """
+
+    retry_after_ms: Optional[int]
+    """ Time to wait before sending again. May be None. """
+
+    def __init__(self, action_id: Optional[str], retry_after_ms: Optional[int]):
+        super().__init__()
+        self.id = action_id
+        self.retry_after_ms = retry_after_ms
+
+    @classmethod
+    def parse(cls, dict_message: dict):
+        return cls(
+            action_id=dict_message.get('id'),
+            retry_after_ms=dict_message['error'].get('retryAfterMs')
+        )
+
+
 class ActionHandlerConfigChanged(AbstractActionHandlerMessage):
     type = ActionMessageType.CONFIG_CHANGED
 
@@ -282,6 +312,10 @@ class ActionHandlerMessageParser:
         """
         if self.message:
             message_type = self.message.get('type')
+
+            error = self.message.get('error')
+            if message_type is None and isinstance(error, dict) and error.get('code') == 429:
+                return ActionHandlerRateLimited.parse(self.message)
 
             try:
                 action_type = ActionMessageType(message_type)
@@ -606,6 +640,9 @@ class AbstractActionWebSocketHandler(AbstractAuthenticatedWebSocketHandler):
                     time.sleep(1)
                     self.send(action_handler_result.stringify_result())
 
+            elif isinstance(action_message, ActionHandlerRateLimited):
+                self._resend_result_later(action_message)
+
             elif isinstance(action_message, ActionHandlerConfigChanged):
                 logger.info('Handling "%s"', action_message.type)
                 self.on_config_changed()
@@ -626,6 +663,42 @@ class AbstractActionWebSocketHandler(AbstractAuthenticatedWebSocketHandler):
             logger.error(str(err))
             if isinstance(action_message, AbstractActionHandlerIdMessage):
                 self.send(str(ActionHandlerNack(action_message.id, 500, str(err))))
+
+    def _resend_result_later(self, rate_limited: ActionHandlerRateLimited) -> None:
+        """
+        The ws-proxy rejected one of our messages because of rate limiting. If this refers to a stored result, send it
+        again after the demanded wait. This never answers with a NACK, and it does not use up the retries of the
+        stored result: it stays there until it is acknowledged or has expired.
+
+        :param rate_limited: The rate limit message.
+        """
+        stored = self.resultStore.get(rate_limited.id) if rate_limited.id else None
+
+        if not isinstance(stored, ActionHandlerResult):
+            logger.warning('Rate limited by remote (id: %s, retry after %s ms), but no stored result refers to it.',
+                           rate_limited.id, rate_limited.retry_after_ms)
+            return
+
+        wait = jittered_wait(rate_limited.retry_after_ms / 1000 if rate_limited.retry_after_ms is not None else 1.0)
+
+        logger.warning('Rate limited by remote (id: %s). Sending %s again in %.1fs.', stored.id, stored.type, wait)
+
+        timer = threading.Timer(wait, lambda: self._resend_result(stored.id))
+        timer.daemon = True
+        timer.start()
+
+    def _resend_result(self, action_id: str) -> None:
+        """
+        Send the result stored for *action_id* again, unless it has been acknowledged or has expired meanwhile.
+
+        :param action_id: Id of the action.
+        """
+        result = self.resultStore.get(action_id)
+        if isinstance(result, ActionHandlerResult):
+            try:
+                self.send(result.stringify_result())
+            except Exception as err:
+                logger.warning('Cannot send %s (id: %s) again: %s', result.type, result.id, str(err))
 
     ###############################################################################################################
     # API methods

@@ -10,9 +10,9 @@ from typing import List, Dict, Optional
 from urllib.parse import urlencode
 
 from websocket import WebSocketApp, ABNF, WebSocketException, setdefaulttimeout, WebSocketConnectionClosedException, \
-    STATUS_NORMAL, STATUS_UNEXPECTED_CONDITION
+    WebSocketBadStatusException, STATUS_NORMAL, STATUS_UNEXPECTED_CONDITION
 
-from hiro_graph_client.clientlib import AbstractTokenApiHandler
+from hiro_graph_client.clientlib import AbstractTokenApiHandler, parse_retry_after, jittered_wait
 
 logger = logging.getLogger(__name__)
 """ The logger for this module """
@@ -157,6 +157,7 @@ class AbstractAuthenticatedWebSocketHandler:
 
         self._ws_guard = threading.RLock()
         self._backoff_condition = threading.Condition()
+        self._rate_limit_delay = None
 
         if remote_exit_codes:
             self._remote_exit_codes = remote_exit_codes
@@ -288,7 +289,15 @@ class AbstractAuthenticatedWebSocketHandler:
                 if self._reader_status == ReaderStatus.DONE and isinstance(error, OSError) and error.errno == 9:
                     return
 
-            self._set_error(error)
+            if isinstance(error, WebSocketBadStatusException) and error.status_code == 429:
+                # Rate limited while opening the connection. This is not fatal: wait as demanded and reconnect.
+                headers = {k.lower(): v for k, v in (error.resp_headers or {}).items()}
+                self._rate_limit_delay = parse_retry_after(headers.get('retry-after'))
+                logger.warning("Rate limited while opening websocket (retry-after: %s). Will reconnect.",
+                               headers.get('retry-after'))
+            else:
+                self._set_error(error)
+
             self.on_error(ws, error)
         except Exception as err:
             self._set_error(err)
@@ -297,6 +306,9 @@ class AbstractAuthenticatedWebSocketHandler:
         """
         Sleeps for *reconnect_delay* seconds, then returns the delay in seconds for the next try.
 
+        This is also used by *send()* in arbitrary threads, so it deliberately knows nothing about *Retry-After*.
+        See *_reconnect_backoff()*.
+
         :param reconnect_delay: Delay in seconds to wait.
         :return: Next value for the delay.
         """
@@ -304,9 +316,31 @@ class AbstractAuthenticatedWebSocketHandler:
             if reconnect_delay:
                 self._backoff_condition.wait(timeout=reconnect_delay)
 
+        return self._next_delay(reconnect_delay)
+
+    @staticmethod
+    def _next_delay(reconnect_delay: int) -> int:
         return (reconnect_delay + 1) if reconnect_delay < 10 \
             else (reconnect_delay + 10) if reconnect_delay < 60 \
             else random.randint(60, 600)
+
+    def _reconnect_backoff(self, reconnect_delay: int) -> int:
+        """
+        Like *_backoff()*, but waits at least (with jitter) for the *Retry-After* of a preceding 429 on connect, if
+        any. Only the reconnect loop in *run_forever()* may call this, so no other thread can take the delay away.
+
+        :param reconnect_delay: Delay in seconds to wait.
+        :return: Next value for the delay.
+        """
+        retry_after, self._rate_limit_delay = self._rate_limit_delay, None
+
+        if retry_after is None:
+            return self._backoff(reconnect_delay)
+
+        with self._backoff_condition:
+            self._backoff_condition.wait(timeout=max(reconnect_delay, jittered_wait(retry_after)))
+
+        return self._next_delay(reconnect_delay)
 
     def _close(self, status: str = STATUS_NORMAL, reason: str = None):
         """
@@ -443,7 +477,7 @@ class AbstractAuthenticatedWebSocketHandler:
                 finally:
                     self._reader_guard.acquire()
 
-                self._reconnect_delay = self._backoff(self._reconnect_delay)
+                self._reconnect_delay = self._reconnect_backoff(self._reconnect_delay)
 
             self.on_close(self._ws)
 

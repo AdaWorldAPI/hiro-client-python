@@ -1,3 +1,19 @@
+# v5.4.0
+
+* [feature] HTTP status 429 (Too Many Requests) from the HIRO rate limiter is handled. A rejected request is repeated
+  after waiting for the `Retry-After` header (with jitter; 1s, 2s, 4s... when the header is missing). This is
+  independent from the `max_tries` retries for 5xx errors. Configure it with the new parameters
+  `rate_limit_max_retries` (default 3, 0 disables) and `rate_limit_max_wait` (default 60 seconds per wait, 0 means
+  never wait). When the retries are used up or the demanded wait exceeds the cap, the new `HiroRateLimitError` (a
+  subclass of `requests.exceptions.HTTPError` with `retry_after`, `policy` and `ratelimit`) is raised. Streaming
+  downloads are only repeated while no data has been received. This policy is a deliberate choice for a library: other
+  components either hand 429 to the caller or retry without limit.
+* [feature] A 429 while opening a WebSocket no longer terminates it. The reconnect waits at least `Retry-After` (with
+  jitter).
+* [feature] Action WebSocket: when the ws-proxy rejects a frame with `{"error": {"code": 429, "retryAfterMs": ...},
+  "id": ...}`, a stored `sendActionResult` is sent again after `retryAfterMs` (with jitter) until it is acknowledged or
+  expired. Previously this was answered with a `negativeAcknowledged` (400) and the result was never re-sent.
+
 # v5.3.5
 
 * [bugfix] An unset `max_tries` was stored as `None`, which `backoff` interprets as "retry forever". Requests to an

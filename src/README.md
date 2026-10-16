@@ -356,6 +356,44 @@ exception. All three cases are subclasses of `HiroTimeoutError`, so catching tha
 The subclasses keep the original `requests` class as an additional base class, so existing error handling that
 catches `requests.exceptions.ConnectTimeout`, `ReadTimeout` or `ConnectionError` keeps working unchanged.
 
+### Rate limiting (status 429)
+
+The HIRO rate limiter answers with status 429 and a `Retry-After` header (seconds) when a limit is exceeded. All
+clients handle this transparently: the request is repeated after waiting for `Retry-After` (plus a small jitter, or
+1s, 2s, 4s... when the header is missing). This is independent from the `max_tries` retries for 5xx errors and
+connection problems.
+
+```python
+from hiro_graph_client import HiroGraph, PasswordAuthTokenApiHandler
+from hiro_graph_client.clientlib import HiroRateLimitError
+
+handler = PasswordAuthTokenApiHandler(root_url="https://core.engine.datagroup.de",
+                                      username="...", password="...", client_id="...", client_secret="...",
+                                      rate_limit_max_retries=3,  # Default. Use 0 to never retry.
+                                      rate_limit_max_wait=60)  # Default. Max seconds for one wait. 0: never wait.
+
+hiro_client = HiroGraph(api_handler=handler)
+
+try:
+    hiro_client.query('ogit/_type:"ogit/Automation/AutomationIssue"')
+except HiroRateLimitError as err:
+    # Raised when all retries are used up or the demanded wait exceeds rate_limit_max_wait.
+    print(err.retry_after, err.policy, err.ratelimit)
+```
+
+`HiroRateLimitError` is a subclass of `requests.exceptions.HTTPError`. The options are set on the handler and inherited
+by all clients that use it via `api_handler=`, like the other connection settings. Streaming downloads
+(`get_binary`) are only repeated as long as no data has been received yet.
+
+This policy (at most 3 retries, each wait capped at 60s, then raise) is a deliberate choice for a library: a caller
+is neither left blocked indefinitely nor forced to implement the waiting itself. Use `rate_limit_max_retries=0` to
+handle 429 completely on your own.
+
+WebSockets that get a 429 while connecting do not fail. They wait at least `Retry-After` seconds (plus jitter) and
+reconnect. The action WebSocket also handles the in-band `{"error": {"code": 429, "retryAfterMs": ...}, "id": ...}`
+that the ws-proxy sends for a denied frame: a stored `sendActionResult` is sent again after `retryAfterMs`, until it
+is acknowledged or has expired. It is never answered with a `negativeAcknowledged`.
+
 ### Other errors
 
 HTTP error responses raise `requests.exceptions.HTTPError` unless the handler has been created with
