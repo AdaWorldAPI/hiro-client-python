@@ -3,16 +3,21 @@ import base64
 import json
 import logging
 import os
+import random
+import socket
 import threading
 import time
 import urllib
 from abc import abstractmethod
-from typing import Optional, Any, Iterator, Union, Tuple
+from contextlib import contextmanager
+from email.utils import parsedate_to_datetime
+from typing import Optional, Any, Iterator, List, Union, Tuple
 from urllib.parse import quote, urlencode
 
 import backoff
 import requests
 import requests.adapters
+import urllib3
 
 from hiro_graph_client.version import __version__
 
@@ -27,6 +32,123 @@ BACKOFF_KWARGS = {
     'jitter': backoff.random_jitter,
     'giveup': lambda e: e.response is not None and e.response.status_code < 500
 }
+
+def parse_retry_after(value: Optional[str]) -> Optional[float]:
+    """
+    Parse the value of a *Retry-After* header (RFC 9110), which is either a number of seconds or an HTTP date.
+
+    :param value: The raw header value.
+    :return: The number of seconds to wait (never negative), or None when *value* is missing or invalid.
+    """
+    if not value:
+        return None
+
+    value = value.strip()
+
+    try:
+        seconds = float(value)
+        return seconds if seconds >= 0 else None
+    except ValueError:
+        pass
+
+    try:
+        return max(0.0, parsedate_to_datetime(value).timestamp() - time.time())
+    except (TypeError, ValueError, IndexError, OverflowError):
+        return None
+
+
+def jittered_wait(wait: float, cap: Optional[float] = None) -> float:
+    """
+    Add a little random jitter to a wait so clients that have been told the same *Retry-After* do not all come back
+    at the same moment.
+
+    :param wait: Seconds to wait at least.
+    :param cap: Optional upper bound of the result. Never reduces the result below *wait*.
+    :return: *wait* plus up to 10% (max 1s) of jitter.
+    """
+    jittered = wait + random.uniform(0, min(1.0, wait * 0.1))
+    return jittered if cap is None else max(wait, min(jittered, cap))
+
+
+TIMEOUT_CAUSES = (urllib3.exceptions.TimeoutError, socket.timeout, TimeoutError)
+"""Exception types that identify an underlying timeout, no matter which *requests* exception wraps them."""
+
+
+def _is_timeout_error(err: BaseException) -> bool:
+    """
+    Check whether *err* has been caused by a timeout.
+
+    This is needed because *requests* does not report every timeout as a *requests.exceptions.Timeout*: when the
+    timeout happens while the response *body* is being read, it surfaces as a plain *requests.exceptions.ConnectionError*
+    instead. The original timeout is still reachable through the exception arguments and the __cause__/__context__
+    chain, so search those instead of matching on the error message.
+
+    :param err: The exception to inspect.
+    :return: True when a timeout is found anywhere in the chain of causes.
+    """
+    pending: List[BaseException] = [err]
+    seen: set = set()
+
+    while pending:
+        current = pending.pop()
+
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+
+        if isinstance(current, TIMEOUT_CAUSES):
+            return True
+
+        pending.extend(item for item in (*current.args, current.__cause__, current.__context__)
+                       if isinstance(item, BaseException))
+
+    return False
+
+
+def _as_hiro_timeout(err: requests.exceptions.RequestException) -> 'HiroTimeoutError':
+    """
+    Create the :class:`HiroTimeoutError` matching *err*.
+
+    The returned exception keeps the original *requests* class as a second base class, so error handling that catches
+    the specific *requests* exception keeps working unchanged.
+
+    :param err: The original timeout exception raised by *requests*.
+    :return: The matching :class:`HiroTimeoutError` subclass.
+    """
+    if isinstance(err, requests.exceptions.ConnectTimeout):
+        error_class = HiroConnectTimeoutError
+    elif isinstance(err, requests.exceptions.ReadTimeout):
+        error_class = HiroReadTimeoutError
+    elif isinstance(err, requests.exceptions.ConnectionError):
+        error_class = HiroBodyTimeoutError
+    else:
+        error_class = HiroTimeoutError
+
+    return error_class(*err.args, request=err.request, response=err.response)
+
+
+@contextmanager
+def _translate_timeout_errors() -> Iterator[None]:
+    """
+    Context manager that normalizes all timeouts of *requests* so they can be caught as a single
+    :class:`HiroTimeoutError`.
+
+    Without this, the exception class raised on a timeout depends on *when* the timeout happens: *ConnectTimeout* while
+    connecting, *ReadTimeout* while waiting for the response headers and *ConnectionError* while reading the response
+    body. Callers had to know all three to handle a timeout reliably.
+
+    :raises HiroTimeoutError: When the wrapped code times out.
+    """
+    try:
+        yield
+    except HiroTimeoutError:
+        raise
+    except requests.exceptions.Timeout as err:
+        raise _as_hiro_timeout(err) from err
+    except requests.exceptions.ConnectionError as err:
+        if not _is_timeout_error(err):
+            raise
+        raise _as_hiro_timeout(err) from err
 
 
 ###################################################################################################################
@@ -107,8 +229,21 @@ class AbstractAPI:
     _max_tries: int = 2
     """Retries for backoff"""
 
-    _timeout: int = 600
-    """Timeout for requests-methods as needed by package 'requests'."""
+    _rate_limit_max_retries: int = 3
+    """Number of times a request is repeated after the backend answered with status 429 (Too Many Requests)."""
+
+    _rate_limit_max_wait: Union[int, float] = 60
+    """Max seconds to wait for a single retry after status 429. A longer wait raises *HiroRateLimitError* instead."""
+
+    _connect_timeout: Union[int, float] = 10
+    """Default connect timeout (in seconds) used when *timeout* is given as a single scalar value."""
+
+    _timeout: Union[int, float, Tuple[Union[int, float], Union[int, float]]] = (10, 600)
+    """
+    Timeout for requests-methods as needed by package 'requests'. This is a tuple *(connect, read)* so the connection
+    establishment is bounded by a short connect timeout while the (potentially slow) read is bounded separately. A
+    single scalar value is also accepted and will be combined with the default connect timeout.
+    """
 
     _raise_exceptions: bool = True
     """Raise an exception when the status-code of results indicates an error"""
@@ -128,11 +263,13 @@ class AbstractAPI:
                  raise_exceptions: bool = True,
                  proxies: dict = None,
                  headers: dict = None,
-                 timeout: int = None,
+                 timeout: Optional[Union[int, float, Tuple[Union[int, float], Union[int, float]]]] = None,
                  client_name: str = None,
                  ssl_config: SSLConfig = None,
                  log_communication_on_error: bool = None,
                  max_tries: int = None,
+                 rate_limit_max_retries: int = None,
+                 rate_limit_max_wait: Union[int, float] = None,
                  abstract_api=None):
 
         """
@@ -147,7 +284,10 @@ class AbstractAPI:
         :param raise_exceptions: Raise exceptions on HTTP status codes that denote an error. Default is True.
         :param proxies: Proxy configuration for *requests*. Default is None.
         :param headers: Optional custom HTTP headers. Will be merged with the internal default headers. Default is None.
-        :param timeout: Optional timeout for requests. Default is 600 (10 min).
+        :param timeout: Optional timeout (in seconds) for requests. Can be a single scalar (applied as read timeout,
+               combined with the default connect timeout) or a tuple *(connect, read)* passed straight to *requests*.
+               A short connect timeout avoids hanging for the full read timeout when a host is unreachable. Default is
+               *(10, 600)*, i.e. a 10 second connect timeout and a 600 second (10 min) read timeout.
         :param client_name: Optional name for the client. Will also be part of the "User-Agent" header unless *headers*
                is given with another value for "User-Agent". Default is "hiro-graph-client".
         :param ssl_config: Optional configuration for SSL connections. If this is omitted, the defaults of `requests`
@@ -155,6 +295,10 @@ class AbstractAPI:
         :param log_communication_on_error: Log socket communication when an error (status_code of HTTP Response) is
                detected. Default is not to do this.
         :param max_tries: Max tries for BACKOFF. Default is 2.
+        :param rate_limit_max_retries: How often a request is repeated when the backend answers with status 429 (rate
+               limited), after waiting as demanded by the *Retry-After* header. Default is 3. Set to 0 to disable.
+        :param rate_limit_max_wait: Max seconds to wait for a single retry after status 429. When the backend demands a
+               longer wait, *HiroRateLimitError* is raised right away. Default is 60. Set to 0 to never wait.
         :param abstract_api: Set all parameters by copying them from the instance given by this parameter. Overrides
                all other parameters except headers, which will be merged with existing ones.
         """
@@ -170,6 +314,8 @@ class AbstractAPI:
             ssl_config = abstract_api.ssl_config
             log_communication_on_error = abstract_api._log_communication_on_error
             max_tries = abstract_api._max_tries
+            rate_limit_max_retries = abstract_api._rate_limit_max_retries
+            rate_limit_max_wait = abstract_api._rate_limit_max_wait
         else:
             initial_headers = {
                 'Content-Type': 'application/json',
@@ -193,9 +339,33 @@ class AbstractAPI:
 
         self._proxies = proxies
         self._raise_exceptions = raise_exceptions
-        self._timeout = timeout or self._timeout
+        self._timeout = self._normalize_timeout(timeout)
         self._log_communication_on_error = log_communication_on_error or False
-        self._max_tries = max_tries
+        self._max_tries = max_tries or self._max_tries
+        if rate_limit_max_retries is not None:
+            self._rate_limit_max_retries = rate_limit_max_retries
+        if rate_limit_max_wait is not None:
+            self._rate_limit_max_wait = rate_limit_max_wait
+
+    def _normalize_timeout(
+            self,
+            timeout: Optional[Union[int, float, Tuple[Union[int, float], Union[int, float]]]]
+    ) -> Union[int, float, Tuple[Union[int, float], Union[int, float]]]:
+        """
+        Normalize the *timeout* value into a form accepted by *requests*.
+
+        A tuple *(connect, read)* is passed through unchanged. A single scalar is combined with the default connect
+        timeout into a *(connect, read)* tuple so connection establishment does not hang for the full read timeout.
+        *None* falls back to the current (already normalized) default.
+
+        :param timeout: The timeout value given to the constructor.
+        :return: Either a scalar or a *(connect, read)* tuple as understood by *requests*.
+        """
+        if timeout is None:
+            return self._timeout
+        if isinstance(timeout, (tuple, list)):
+            return timeout[0], timeout[1]
+        return self._connect_timeout, timeout
 
     def _get_max_tries(self):
         return self._max_tries
@@ -241,7 +411,8 @@ class AbstractAPI:
 
                 yield from res.iter_content(chunk_size=65536)
 
-        yield from _get_binary()
+        with _translate_timeout_errors():
+            yield from self._retry_generator_on_rate_limit(_get_binary)
 
     def post_binary(self,
                     url: str,
@@ -273,7 +444,8 @@ class AbstractAPI:
             self._log_communication(res, request_body=False)
             return self._parse_response(res, expected_media_type)
 
-        return _post_binary()
+        with _translate_timeout_errors():
+            return self._retry_on_rate_limit(_post_binary)
 
     def put_binary(self,
                    url: str,
@@ -305,7 +477,8 @@ class AbstractAPI:
             self._log_communication(res, request_body=False)
             return self._parse_response(res, expected_media_type)
 
-        return _put_binary()
+        with _translate_timeout_errors():
+            return self._retry_on_rate_limit(_put_binary)
 
     def get(self,
             url: str,
@@ -330,7 +503,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _get()
+        with _translate_timeout_errors():
+            return self._retry_on_rate_limit(_get)
 
     def post(self,
              url: str,
@@ -358,7 +532,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _post()
+        with _translate_timeout_errors():
+            return self._retry_on_rate_limit(_post)
 
     def put(self,
             url: str,
@@ -386,7 +561,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _put()
+        with _translate_timeout_errors():
+            return self._retry_on_rate_limit(_put)
 
     def patch(self,
               url: str,
@@ -414,7 +590,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _patch()
+        with _translate_timeout_errors():
+            return self._retry_on_rate_limit(_patch)
 
     def delete(self,
                url: str,
@@ -439,7 +616,8 @@ class AbstractAPI:
             self._log_communication(res)
             return self._parse_response(res, expected_media_type)
 
-        return _delete()
+        with _translate_timeout_errors():
+            return self._retry_on_rate_limit(_delete)
 
     ###############################################################################################################
     # Tool methods for requests
@@ -510,6 +688,65 @@ class AbstractAPI:
         """
         params_cleaned = {k: AbstractAPI._bool_to_external_str(v) for k, v in params.items() if v is not None}
         return ('?' + urlencode(params_cleaned, quote_via=quote, safe="/,")) if params_cleaned else ""
+
+    def _wait_for_rate_limit(self, err: "HiroRateLimitError", attempt: int) -> None:
+        """
+        Sleep before repeating a request that has been rejected with status 429.
+
+        :param err: The rate limit error. Its *retry_after* is used as wait time, with an exponential fallback.
+        :param attempt: Number of the retry that is about to happen, starting at 1.
+        :raises HiroRateLimitError: *err* itself, when all retries are used up or the wait exceeds the configured cap.
+        """
+        if attempt > self._rate_limit_max_retries:
+            raise err
+
+        wait = err.retry_after if err.retry_after is not None else 2 ** (attempt - 1)
+
+        if wait > self._rate_limit_max_wait:
+            raise err
+
+        wait = jittered_wait(wait, cap=self._rate_limit_max_wait)
+
+        logger.warning("Rate limited by %s (policy: %s). Retry %d/%d in %.1fs.",
+                       err.response.url if err.response is not None else "backend",
+                       err.policy, attempt, self._rate_limit_max_retries, wait)
+        time.sleep(wait)
+
+    def _retry_on_rate_limit(self, func):
+        """
+        Call *func* and repeat it as long as the backend answers with status 429, see *_wait_for_rate_limit()*.
+
+        :param func: A function without parameters that performs the request.
+        :return: The result of *func*.
+        """
+        attempt = 0
+        while True:
+            try:
+                return func()
+            except HiroRateLimitError as err:
+                attempt += 1
+                self._wait_for_rate_limit(err, attempt)
+
+    def _retry_generator_on_rate_limit(self, func):
+        """
+        Like *_retry_on_rate_limit()*, for a generator function. A request is only repeated as long as nothing
+        has been yielded yet.
+
+        :param func: A generator function without parameters.
+        """
+        attempt = 0
+        while True:
+            started = False
+            try:
+                for item in func():
+                    started = True
+                    yield item
+                return
+            except HiroRateLimitError as err:
+                if started:
+                    raise
+                attempt += 1
+                self._wait_for_rate_limit(err, attempt)
 
     def _parse_response(self,
                         res: requests.Response,
@@ -613,6 +850,9 @@ class AbstractAPI:
                 except (json.JSONDecodeError, KeyError, WrongContentTypeError):
                     if '_TOKEN' not in res.text:
                         http_error_msg += ": " + str(res.text)
+
+            if res.status_code == 429:
+                raise HiroRateLimitError(http_error_msg, response=err.response) from err
 
             raise requests.exceptions.HTTPError(http_error_msg, response=err.response) from err
 
@@ -1517,5 +1757,73 @@ class WrongContentTypeError(Exception):
     """
     When the Content-Type of the result is unexpected, i.e. 'application/json' was expected, but something else got
     returned.
+    """
+    pass
+
+
+class HiroRateLimitError(requests.exceptions.HTTPError):
+    """
+    The backend rejected the request with status 429 (Too Many Requests) and the request could not be completed by
+    waiting and retrying (see *rate_limit_max_retries* and *rate_limit_max_wait* of *AbstractAPI*).
+
+    It is an *HTTPError*, so existing handlers for that keep working.
+    """
+
+    @property
+    def retry_after(self) -> Optional[float]:
+        """Seconds the backend asked to wait (header *Retry-After*), or None."""
+        return parse_retry_after(self._header('Retry-After'))
+
+    @property
+    def policy(self) -> Optional[str]:
+        """Raw value of the header *RateLimit-Policy*, or None."""
+        return self._header('RateLimit-Policy')
+
+    @property
+    def ratelimit(self) -> Optional[str]:
+        """Raw value of the header *RateLimit*, or None."""
+        return self._header('RateLimit')
+
+    def _header(self, name: str) -> Optional[str]:
+        return self.response.headers.get(name) if self.response is not None else None
+
+
+class HiroTimeoutError(requests.exceptions.Timeout, TimeoutError):
+    """
+    Raised when a request times out. Catch this to handle *any* timeout.
+
+    *requests* uses a different exception class depending on *when* a timeout occurs: *ConnectTimeout* while connecting,
+    *ReadTimeout* while waiting for the response headers, but a plain *ConnectionError* when the timeout happens while
+    the response body is being read. That last one is not even a *requests.exceptions.Timeout*, which made it easy to
+    miss a timeout in error handling. All of them are raised as a subclass of this class instead.
+
+    This inherits from both :class:`requests.exceptions.Timeout` and the builtin :class:`TimeoutError`, so all of the
+    following catch it::
+
+        except HiroTimeoutError            # explicit
+        except TimeoutError                # builtin
+        except requests.exceptions.Timeout # remains compatible with existing error handling
+
+    The subclasses below additionally keep the original *requests* class, so error handling that catches a specific
+    *requests* exception keeps working unchanged.
+    """
+    pass
+
+
+class HiroConnectTimeoutError(requests.exceptions.ConnectTimeout, HiroTimeoutError):
+    """Raised when the connection to the server could not be established within the connect timeout."""
+    pass
+
+
+class HiroReadTimeoutError(requests.exceptions.ReadTimeout, HiroTimeoutError):
+    """Raised when the server did not send the response headers within the read timeout."""
+    pass
+
+
+class HiroBodyTimeoutError(requests.exceptions.ConnectionError, HiroTimeoutError):
+    """
+    Raised when the server stopped sending data while the response body was being read.
+
+    *requests* reports this as a plain *ConnectionError*, which is why this keeps *ConnectionError* as a base class.
     """
     pass

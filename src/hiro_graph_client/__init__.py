@@ -10,7 +10,8 @@ from hiro_graph_client.authzclient import HiroAuthz
 from hiro_graph_client.client import HiroGraph
 from hiro_graph_client.clientlib import AbstractTokenApiHandler, GraphConnectionHandler, AuthenticationTokenError, \
     FixedTokenError, TokenUnauthorizedError, PasswordAuthTokenApiHandler, FixedTokenApiHandler, \
-    EnvironmentTokenApiHandler, SSLConfig
+    EnvironmentTokenApiHandler, SSLConfig, HiroTimeoutError, HiroConnectTimeoutError, HiroReadTimeoutError, \
+    HiroBodyTimeoutError
 from hiro_graph_client.iamclient import HiroIam
 from hiro_graph_client.kiclient import HiroKi
 from hiro_graph_client.variablesclient import HiroVariables
@@ -21,7 +22,8 @@ this_directory = path.abspath(path.dirname(__file__))
 __all__ = [
     'HiroGraph', 'HiroAuth', 'HiroApp', 'HiroIam', 'HiroKi', 'HiroAuthz', 'HiroVariables', 'GraphConnectionHandler',
     'AbstractTokenApiHandler', 'PasswordAuthTokenApiHandler', 'FixedTokenApiHandler', 'EnvironmentTokenApiHandler',
-    'AuthenticationTokenError', 'FixedTokenError', 'TokenUnauthorizedError', '__version__',
+    'AuthenticationTokenError', 'FixedTokenError', 'TokenUnauthorizedError', 'HiroTimeoutError',
+    'HiroConnectTimeoutError', 'HiroReadTimeoutError', 'HiroBodyTimeoutError', '__version__',
     'SSLConfig'
 ]
 

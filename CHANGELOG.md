@@ -1,3 +1,43 @@
+# v5.4.0
+
+* [feature] HTTP status 429 (Too Many Requests) from the HIRO rate limiter is handled. A rejected request is repeated
+  after waiting for the `Retry-After` header (with jitter; 1s, 2s, 4s... when the header is missing). This is
+  independent from the `max_tries` retries for 5xx errors. Configure it with the new parameters
+  `rate_limit_max_retries` (default 3, 0 disables) and `rate_limit_max_wait` (default 60 seconds per wait, 0 means
+  never wait). When the retries are used up or the demanded wait exceeds the cap, the new `HiroRateLimitError` (a
+  subclass of `requests.exceptions.HTTPError` with `retry_after`, `policy` and `ratelimit`) is raised. Streaming
+  downloads are only repeated while no data has been received. This policy is a deliberate choice for a library: other
+  components either hand 429 to the caller or retry without limit.
+* [feature] A 429 while opening a WebSocket no longer terminates it. The reconnect waits at least `Retry-After` (with
+  jitter).
+* [feature] Action WebSocket: when the ws-proxy rejects a frame with `{"error": {"code": 429, "retryAfterMs": ...},
+  "id": ...}`, a stored `sendActionResult` is sent again after `retryAfterMs` (with jitter) until it is acknowledged or
+  expired. Previously this was answered with a `negativeAcknowledged` (400) and the result was never re-sent.
+
+# v5.3.5
+
+* [bugfix] An unset `max_tries` was stored as `None`, which `backoff` interprets as "retry forever". Requests to an
+  unreachable host therefore retried endlessly and never surfaced the connect timeout added in v5.3.4. `max_tries` now
+  falls back to its documented default of `2`.
+* [bugfix] Timeouts are now raised as `HiroTimeoutError`, which inherits from both `requests.exceptions.Timeout` and
+  the builtin `TimeoutError`. Previously the exception class depended on when the timeout occurred, and a timeout while
+  reading the response body surfaced as a plain `requests.exceptions.ConnectionError` - so it was not caught by
+  `except TimeoutError` nor by `except requests.exceptions.Timeout` and crashed the calling script. The subclasses
+  `HiroConnectTimeoutError`, `HiroReadTimeoutError` and `HiroBodyTimeoutError` keep the original `requests` class as an
+  additional base class, so existing error handling keeps working unchanged. See "Timeouts and error handling" in
+  `src/README.md`.
+
+# v5.3.4
+
+* [bugfix] Connection establishment now honors a dedicated connect timeout. The `timeout` parameter accepts a
+  `(connect, read)` tuple (or a scalar, which is combined with the default connect timeout). The default changed from
+  `600` to `(10, 600)` so an unreachable host no longer blocks for the full read timeout.
+
+# v5.3.3
+
+* Update setuptools.
+* Fix `escaped_query`.
+
 # v5.3.2
 
 * Point to https://core.engine.datagroup.de instead of https://core.arago.co.
